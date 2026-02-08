@@ -57,6 +57,7 @@ class RandomCameraDataModuleConfig:
     progressive_until: int = 0  # progressive ranges for elevation, azimuth, r, fovy
 
     rays_d_normalize: bool = True
+    same_view_per_rank: bool = True  # whether to use the same random views for all GPUs in DDP (for more stable training curves, especially when using very few views)
 
 
 class RandomCameraIterableDataset(IterableDataset, Updateable):
@@ -102,6 +103,7 @@ class RandomCameraIterableDataset(IterableDataset, Updateable):
         self.azimuth_range = self.cfg.azimuth_range
         self.camera_distance_range = self.cfg.camera_distance_range
         self.fovy_range = self.cfg.fovy_range
+        self.same_view_per_rank = self.cfg.same_view_per_rank and torch.distributed.is_available() and torch.distributed.is_initialized()
 
     def update_step(self, epoch: int, global_step: int, on_load_weights: bool = False):
         size_ind = bisect.bisect_right(self.resolution_milestones, global_step) - 1
@@ -141,6 +143,13 @@ class RandomCameraIterableDataset(IterableDataset, Updateable):
         # ]
 
     def collate(self, batch) -> Dict[str, Any]:
+        # Get DDP rank to ensure different views per GPU
+        if not self.same_view_per_rank:
+            rank = torch.distributed.get_rank()
+            # Use rank-specific random state for different views per GPU
+            rng_state = torch.get_rng_state()
+            torch.manual_seed(torch.randint(0, 2**32, (1,)).item() + rank * 12345)
+        
         # sample elevation angles
         elevation_deg: Float[Tensor, "B"]
         elevation: Float[Tensor, "B"]
@@ -326,6 +335,10 @@ class RandomCameraIterableDataset(IterableDataset, Updateable):
         )  # FIXME: hard-coded near and far
         mvp_mtx: Float[Tensor, "B 4 4"] = get_mvp_matrix(c2w, self.proj_mtx)
         self.fovy = fovy
+
+        # Restore RNG state if we modified it for DDP
+        if self.same_view_per_rank:
+            torch.set_rng_state(rng_state)
 
         return {
             "rays_o": rays_o,
