@@ -3,6 +3,7 @@ import contextlib
 import importlib
 import logging
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -162,6 +163,21 @@ def main(args, extras) -> None:
     cfg: ExperimentConfig
     cfg = load_config(args.config, cli_args=extras, n_gpus=n_gpus)
 
+    matmul_precision = str(
+        os.environ.get("THREESTUDIO_MATMUL_PRECISION", cfg.matmul_precision)
+    ).lower()
+    if matmul_precision in {"high", "medium", "highest"}:
+        torch.set_float32_matmul_precision(matmul_precision)
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = matmul_precision != "highest"
+            torch.backends.cudnn.allow_tf32 = matmul_precision != "highest"
+        logger.info(f"Set float32 matmul precision to '{matmul_precision}'")
+    else:
+        logger.warning(
+            f"Invalid matmul precision '{matmul_precision}', expected one of "
+            "{'highest','high','medium'}. Keeping PyTorch default."
+        )
+
     # set a different seed for each device
     pl.seed_everything(cfg.seed + get_rank(), workers=True)
 
@@ -200,13 +216,55 @@ def main(args, extras) -> None:
             callbacks += [
                 ProgressCallback(save_path=os.path.join(cfg.trial_dir, "progress"))
             ]
-        else:
+        elif cfg.trainer.get("enable_progress_bar", True):
             callbacks += [CustomProgressBar(refresh_rate=1)]
 
     def write_to_text(file, lines):
         with open(file, "w") as f:
             for line in lines:
                 f.write(line + "\n")
+
+    def maybe_start_tensorboard() -> None:
+        if not args.tensorboard:
+            return
+        config_base_dir = os.path.dirname(os.path.abspath(args.config))
+
+        def resolve_path(path: str) -> str:
+            if os.path.isabs(path):
+                return path
+            return os.path.abspath(os.path.join(config_base_dir, path))
+
+        logdir = args.tensorboard_logdir.strip()
+        if not logdir:
+            logdir = os.path.join(cfg.trial_dir, "tb_logs")
+        logdir = resolve_path(logdir)
+        os.makedirs(logdir, exist_ok=True)
+
+        tb_log_path = resolve_path(os.path.join(cfg.trial_dir, "tensorboard.log"))
+        cmd = [
+            sys.executable,
+            "-m",
+            "tensorboard.main",
+            "--logdir",
+            logdir,
+            "--host",
+            args.tensorboard_host,
+            "--port",
+            str(args.tensorboard_port),
+            "--reload_interval",
+            str(args.tensorboard_reload_interval),
+        ]
+        with open(tb_log_path, "a") as tb_log_file:
+            subprocess.Popen(
+                cmd,
+                stdout=tb_log_file,
+                stderr=tb_log_file,
+                start_new_session=True,
+            )
+        logger.info(
+            f"Started TensorBoard at http://{args.tensorboard_host}:{args.tensorboard_port} "
+            f"(logdir={logdir}, logs={tb_log_path})"
+        )
 
     loggers = []
     if args.train:
@@ -224,6 +282,8 @@ def main(args, extras) -> None:
                 ["python " + " ".join(sys.argv), str(args)],
             )
         )()
+
+    rank_zero_only(maybe_start_tensorboard)()
 
     trainer = Trainer(
         callbacks=callbacks,
@@ -289,6 +349,34 @@ if __name__ == "__main__":
         "--typecheck",
         action="store_true",
         help="whether to enable dynamic type checking",
+    )
+
+    parser.add_argument(
+        "--tensorboard",
+        action="store_true",
+        help="if true, start a TensorBoard server in background",
+    )
+    parser.add_argument(
+        "--tensorboard-host",
+        default="0.0.0.0",
+        help="host for TensorBoard server",
+    )
+    parser.add_argument(
+        "--tensorboard-port",
+        type=int,
+        default=6006,
+        help="port for TensorBoard server",
+    )
+    parser.add_argument(
+        "--tensorboard-logdir",
+        default="",
+        help="TensorBoard logdir (default: current trial tb_logs)",
+    )
+    parser.add_argument(
+        "--tensorboard-reload-interval",
+        type=float,
+        default=5.0,
+        help="TensorBoard reload interval in seconds",
     )
 
     args, extras = parser.parse_known_args()
