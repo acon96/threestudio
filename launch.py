@@ -1,8 +1,10 @@
 import argparse
+import atexit
 import contextlib
 import importlib
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -162,6 +164,10 @@ def main(args, extras) -> None:
     # parse YAML config to OmegaConf
     cfg: ExperimentConfig
     cfg = load_config(args.config, cli_args=extras, n_gpus=n_gpus)
+    cfg.exp_root_dir = os.path.abspath(cfg.exp_root_dir)
+    cfg.exp_dir = os.path.abspath(cfg.exp_dir)
+    cfg.trial_dir = os.path.abspath(cfg.trial_dir)
+    os.makedirs(cfg.trial_dir, exist_ok=True)
 
     matmul_precision = str(
         os.environ.get("THREESTUDIO_MATMUL_PRECISION", cfg.matmul_precision)
@@ -224,23 +230,47 @@ def main(args, extras) -> None:
             for line in lines:
                 f.write(line + "\n")
 
+    tb_process = None
+
+    def maybe_stop_tensorboard() -> None:
+        nonlocal tb_process
+        if tb_process is None:
+            return
+        if tb_process.poll() is not None:
+            tb_process = None
+            return
+        try:
+            if os.name != "nt":
+                os.killpg(tb_process.pid, signal.SIGTERM)
+            else:
+                tb_process.terminate()
+            tb_process.wait(timeout=5)
+        except Exception:
+            try:
+                if os.name != "nt":
+                    os.killpg(tb_process.pid, signal.SIGKILL)
+                else:
+                    tb_process.kill()
+            except Exception:
+                pass
+        finally:
+            tb_process = None
+
+    atexit.register(maybe_stop_tensorboard)
+
     def maybe_start_tensorboard() -> None:
+        nonlocal tb_process
         if not args.tensorboard:
             return
-        config_base_dir = os.path.dirname(os.path.abspath(args.config))
-
-        def resolve_path(path: str) -> str:
-            if os.path.isabs(path):
-                return path
-            return os.path.abspath(os.path.join(config_base_dir, path))
 
         logdir = args.tensorboard_logdir.strip()
         if not logdir:
             logdir = os.path.join(cfg.trial_dir, "tb_logs")
-        logdir = resolve_path(logdir)
+        logdir = os.path.abspath(logdir)
         os.makedirs(logdir, exist_ok=True)
 
-        tb_log_path = resolve_path(os.path.join(cfg.trial_dir, "tensorboard.log"))
+        tb_log_path = os.path.abspath(os.path.join(cfg.trial_dir, "tensorboard.log"))
+        os.makedirs(os.path.dirname(tb_log_path), exist_ok=True)
         cmd = [
             sys.executable,
             "-m",
@@ -255,7 +285,7 @@ def main(args, extras) -> None:
             str(args.tensorboard_reload_interval),
         ]
         with open(tb_log_path, "a") as tb_log_file:
-            subprocess.Popen(
+            tb_process = subprocess.Popen(
                 cmd,
                 stdout=tb_log_file,
                 stderr=tb_log_file,
@@ -300,23 +330,26 @@ def main(args, extras) -> None:
         ckpt = torch.load(ckpt_path, map_location="cpu")
         system.set_resume_status(ckpt["epoch"], ckpt["global_step"])
 
-    if args.train:
-        trainer.fit(system, datamodule=dm, ckpt_path=cfg.resume)
-        trainer.test(system, datamodule=dm)
-        if args.gradio:
-            # also export assets if in gradio mode
-            trainer.predict(system, datamodule=dm)
-    elif args.validate:
-        # manually set epoch and global_step as they cannot be automatically resumed
-        set_system_status(system, cfg.resume)
-        trainer.validate(system, datamodule=dm, ckpt_path=cfg.resume)
-    elif args.test:
-        # manually set epoch and global_step as they cannot be automatically resumed
-        set_system_status(system, cfg.resume)
-        trainer.test(system, datamodule=dm, ckpt_path=cfg.resume)
-    elif args.export:
-        set_system_status(system, cfg.resume)
-        trainer.predict(system, datamodule=dm, ckpt_path=cfg.resume)
+    try:
+        if args.train:
+            trainer.fit(system, datamodule=dm, ckpt_path=cfg.resume)
+            trainer.test(system, datamodule=dm)
+            if args.gradio:
+                # also export assets if in gradio mode
+                trainer.predict(system, datamodule=dm)
+        elif args.validate:
+            # manually set epoch and global_step as they cannot be automatically resumed
+            set_system_status(system, cfg.resume)
+            trainer.validate(system, datamodule=dm, ckpt_path=cfg.resume)
+        elif args.test:
+            # manually set epoch and global_step as they cannot be automatically resumed
+            set_system_status(system, cfg.resume)
+            trainer.test(system, datamodule=dm, ckpt_path=cfg.resume)
+        elif args.export:
+            set_system_status(system, cfg.resume)
+            trainer.predict(system, datamodule=dm, ckpt_path=cfg.resume)
+    finally:
+        rank_zero_only(maybe_stop_tensorboard)()
 
 
 if __name__ == "__main__":

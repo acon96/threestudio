@@ -4,7 +4,7 @@ jaxtyping
 typeguard
 git+https://github.com/KAIR-BAIR/nerfacc.git@v0.5.2
 git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
-diffusers<0.20
+diffusers==0.36.0
 transformers<5
 accelerate
 opencv-python
@@ -13,7 +13,7 @@ matplotlib
 imageio>=2.28.0
 imageio[ffmpeg]
 git+https://github.com/NVlabs/nvdiffrast.git
-libigl
+libigl==2.5.1
 xatlas
 trimesh[easy]
 networkx
@@ -28,7 +28,7 @@ ipywidgets
 
 # deepfloyd
 xformers
-bitsandbytes==0.38.1
+bitsandbytes==0.49.1
 sentencepiece
 safetensors
 huggingface_hub

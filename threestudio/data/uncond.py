@@ -146,9 +146,12 @@ class RandomCameraIterableDataset(IterableDataset, Updateable):
         # Get DDP rank to ensure different views per GPU
         if not self.same_view_per_rank:
             rank = torch.distributed.get_rank()
-            # Use rank-specific random state for different views per GPU
+            # Save RNG states so we can restore after rank-specific sampling
             rng_state = torch.get_rng_state()
-            torch.manual_seed(torch.randint(0, 2**32, (1,)).item() + rank * 12345)
+            py_rng_state = random.getstate()
+            seed = torch.randint(0, 2**32, (1,)).item() + rank * 12345
+            torch.manual_seed(seed)
+            random.seed(seed)
         
         # sample elevation angles
         elevation_deg: Float[Tensor, "B"]
@@ -339,8 +342,9 @@ class RandomCameraIterableDataset(IterableDataset, Updateable):
         self.fovy = fovy
 
         # Restore RNG state if we modified it for DDP
-        if self.same_view_per_rank:
+        if not self.same_view_per_rank:
             torch.set_rng_state(rng_state)
+            random.setstate(py_rng_state)
 
         return {
             "rays_o": rays_o,
